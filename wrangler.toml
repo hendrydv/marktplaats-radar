@@ -1,0 +1,20 @@
+name = "marktplaats-radar"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "marktplaats-radar"
+database_id = "c43c5b49-43ba-4753-b489-7ac95f5a46bb"
+migrations_dir = "migrations"
+
+[[services]]
+binding = "SELF"
+service = "marktplaats-radar"
+
+[observability]
+enabled = true
