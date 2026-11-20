@@ -214,6 +214,45 @@ export async function loadSeenAndTouch(
   return toSeenMap(results.slice(0, selects.length));
 }
 
+export interface Claim {
+  itemId: string;
+  lastPriceCents: number;
+  /** null for a new listing, else the price stored before this run (a price drop). */
+  previousPriceCents: number | null;
+}
+
+// Atomically mark matches as notified before anything is pushed. Runs of the same
+// sniper (one per term) can overlap; only the run whose write lands first gets the
+// item back and may push it.
+export async function claimItems(db: D1Database, sniperId: number, claims: Claim[]): Promise<Set<string>> {
+  if (claims.length === 0) return new Set();
+  const insert = db.prepare(
+    `INSERT INTO seen (sniper_id, item_id, last_price_cents, notified) VALUES (?, ?, ?, 1)
+     ON CONFLICT (sniper_id, item_id) DO NOTHING RETURNING item_id`,
+  );
+  const drop = db.prepare(
+    `UPDATE seen SET notified = 1, last_price_cents = ?
+     WHERE sniper_id = ? AND item_id = ? AND notified = 0 RETURNING item_id`,
+  );
+  const results = await db.batch<{ item_id: string }>(
+    claims.map((c) =>
+      c.previousPriceCents == null
+        ? insert.bind(sniperId, c.itemId, c.lastPriceCents)
+        : drop.bind(c.lastPriceCents, sniperId, c.itemId),
+    ),
+  );
+  return new Set(results.flatMap((r) => r.results.map((row) => row.item_id)));
+}
+
+// Undo a claim whose notification failed, so a later run detects it again.
+export function releaseClaimStmt(db: D1Database, sniperId: number, c: Claim): D1PreparedStatement {
+  return c.previousPriceCents == null
+    ? db.prepare("DELETE FROM seen WHERE sniper_id = ? AND item_id = ?").bind(sniperId, c.itemId)
+    : db
+        .prepare("UPDATE seen SET notified = 0, last_price_cents = ? WHERE sniper_id = ? AND item_id = ?")
+        .bind(c.previousPriceCents, sniperId, c.itemId);
+}
+
 export function resetErrorsStmt(db: D1Database, sniperId: number): D1PreparedStatement {
   return db.prepare("UPDATE snipers SET consecutive_errors = 0, last_error = NULL WHERE id = ?").bind(sniperId);
 }

@@ -1,4 +1,4 @@
-import { loadSeenAndTouch, recordError, resetErrorsStmt, saveRun, type FindInsert, type PushState, type SeenUpsert } from "./db";
+import { claimItems, loadSeenAndTouch, releaseClaimStmt, type Claim, recordError, resetErrorsStmt, saveRun, type FindInsert, type PushState, type SeenUpsert } from "./db";
 import { runStatStmt } from "./stats";
 import { matchesSniper } from "./filters";
 import { parseListings } from "./marktplaats";
@@ -80,6 +80,8 @@ export async function runSniper(sniper: Sniper, ctx: RunContext, deps: RadarDeps
   ]);
   const upserts: SeenUpsert[] = [];
   const finds: FindInsert[] = [];
+  const releases: D1PreparedStatement[] = [];
+  const candidates: { l: Listing; claim: Claim }[] = [];
   let pushes = 0;
   let extra = 0;
 
@@ -90,37 +92,46 @@ export async function runSniper(sniper: Sniper, ctx: RunContext, deps: RadarDeps
     const isBlocked = l.sellerId != null && blocked.has(l.sellerId);
 
     if ((isNew || priceDropped) && !isBlocked && matchesSniper(l, sniper, term)) {
-      const previousPriceCents = priceDropped ? prev!.lastPriceCents : null;
-      const pct = l.hasPrice ? dealPercent(l.priceCents, market) : null;
-      let pushed: PushState;
-      if (paused) pushed = 2;
-      else if (ctx.quiet) pushed = 0;
-      else if (pushes < MAX_PUSH) {
-        pushes++;
-        try {
-          await deps.notify({ sniper, listing: l, previousPriceCents, dealPercent: pct, marketPriceCents: market });
-        } catch {
-          // Leave state untouched so the next run detects it again and retries.
-          continue;
-        }
-        pushed = 1;
-      } else {
-        extra++;
-        pushed = 2;
-      }
-      upserts.push({ itemId: l.itemId, lastPriceCents: l.priceCents, notified: true });
-      finds.push({
-        sniperId: sniper.id, itemId: l.itemId, title: l.title, priceCents: l.priceCents, hasPrice: l.hasPrice,
-        previousPriceCents, dealPercent: pct, city: l.city, imageUrl: l.imageUrl, url: l.url,
-        sellerId: l.sellerId, sellerName: l.sellerName, query: term, pushed,
-      });
+      candidates.push({ l, claim: { itemId: l.itemId, lastPriceCents: l.priceCents, previousPriceCents: prev?.lastPriceCents ?? null } });
       continue;
     }
 
-    // Only write what changed, to stay within D1's free write quota.
+    // Only write what changed, to stay within D1's free write quota. The upsert keeps
+    // notified = MAX(...), so it never undoes a claim made by a parallel run.
     if (isNew || prev!.lastPriceCents !== l.priceCents) {
       upserts.push({ itemId: l.itemId, lastPriceCents: l.priceCents, notified: false });
     }
+  }
+
+  // Another run of this sniper (a different term) may have claimed some already.
+  const claimed = await claimItems(db, sniper.id, candidates.map((c) => c.claim));
+
+  for (const { l, claim } of candidates) {
+    if (!claimed.has(l.itemId)) continue;
+    const previousPriceCents = claim.previousPriceCents;
+    const pct = l.hasPrice ? dealPercent(l.priceCents, market) : null;
+    let pushed: PushState;
+    if (paused) pushed = 2;
+    else if (ctx.quiet) pushed = 0;
+    else if (pushes < MAX_PUSH) {
+      pushes++;
+      try {
+        await deps.notify({ sniper, listing: l, previousPriceCents, dealPercent: pct, marketPriceCents: market });
+      } catch {
+        // Release the claim so the next run detects it again and retries.
+        releases.push(releaseClaimStmt(db, sniper.id, claim));
+        continue;
+      }
+      pushed = 1;
+    } else {
+      extra++;
+      pushed = 2;
+    }
+    finds.push({
+      sniperId: sniper.id, itemId: l.itemId, title: l.title, priceCents: l.priceCents, hasPrice: l.hasPrice,
+      previousPriceCents, dealPercent: pct, city: l.city, imageUrl: l.imageUrl, url: l.url,
+      sellerId: l.sellerId, sellerName: l.sellerName, query: term, pushed,
+    });
   }
 
   if (extra > 0 && deps.summarize) {
@@ -132,14 +143,15 @@ export async function runSniper(sniper: Sniper, ctx: RunContext, deps: RadarDeps
   }
 
   // Quiet minute: nothing to write, loadSeenAndTouch already recorded the run.
-  if (upserts.length > 0 || finds.length > 0) {
-    const newSeen = upserts.filter((u) => !seen.has(u.itemId)).length;
+  if (upserts.length > 0 || finds.length > 0 || releases.length > 0) {
+    const newSeen = upserts.filter((u) => !seen.has(u.itemId)).length + finds.filter((f) => !seen.has(f.itemId)).length;
     const count = (p: PushState) => finds.filter((f) => f.pushed === p).length;
     await saveRun(db, sniper.id, upserts, finds, {
       extra: [
         runStatStmt(db, {
           ...stat, newSeen, matched: finds.length, pushed: count(1), held: count(0), silent: count(2),
         }),
+        ...releases,
       ],
     });
   }

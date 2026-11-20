@@ -269,6 +269,43 @@ describe("runSniper", () => {
     expect(f).toMatchObject({ query: "rookkanaal", sellerId: 1, sellerName: "Verkoper 1", pushed: 1 });
   });
 
+  it("two terms running at the same time push a shared listing only once", async () => {
+    const t = await setup({ queries: ["rookkanaal", "kachelpijp"] });
+    await t.run("rookkanaal");
+    await t.run("kachelpijp");
+    const sniper = (await getSniper(db, t.id))!;
+    const sent: string[] = [];
+    let other: Promise<unknown> | null = null;
+    const deps: RadarDeps = {
+      db,
+      fetchSearch: async () => ({ listings: [rawListing("m8", 100)] }),
+      // The second term's run happens entirely while the first is still sending.
+      notify: async (n) => {
+        sent.push(n.listing.itemId);
+        if (!other) {
+          other = runSniper(sniper, { term: "kachelpijp", quiet: false, blockedSellers: [] }, deps);
+          await other;
+        }
+      },
+    };
+    await runSniper(sniper, { term: "rookkanaal", quiet: false, blockedSellers: [] }, deps);
+    await other;
+    expect(sent).toEqual(["m8"]);
+    expect((await recentFinds(db)).filter((x) => x.sniperId === t.id && x.itemId === "m8")).toHaveLength(1);
+  });
+
+  it("a failed notification of a new listing releases it so a later run retries", async () => {
+    const t = await setup({ queries: ["rookkanaal", "kachelpijp"] });
+    await t.run("rookkanaal");
+    await t.run("kachelpijp");
+    t.respond({ listings: [rawListing("m9", 100)] });
+    t.failNotifyOnce();
+    await t.run("rookkanaal");
+    expect(t.sent).toHaveLength(0);
+    await t.run("kachelpijp");
+    expect(t.sent).toHaveLength(1);
+  });
+
   it("title-only matching uses the searched term", async () => {
     const t = await setup({ queries: ["rookkanaal", "kachelpijp"], titleOnly: true });
     await t.run("kachelpijp");
